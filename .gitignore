@@ -1,9 +1,0 @@
-__pycache__/
-*.py[cod]
-.venv/
-rosbags/
-*.db3
-*.mcap
-*.bag
-*.db3-*
-recordings/
