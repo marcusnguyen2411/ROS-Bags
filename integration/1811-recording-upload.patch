@@ -1,0 +1,153 @@
+--- a/.gitignore
++++ b/.gitignore
+@@ -28,2 +28,3 @@
+ # ROS bag recordings are per-session data, not source.
++/.rosbag-upload/
+ /recordings/
+--- a/ros2_ws/src/vehicle_ui_hub/CMakeLists.txt
++++ b/ros2_ws/src/vehicle_ui_hub/CMakeLists.txt
+@@ -33,2 +33,5 @@
+   find_package(Python3 REQUIRED COMPONENTS Interpreter)
++  add_test(NAME github_upload_queue_python COMMAND ${Python3_EXECUTABLE}
++    ${CMAKE_CURRENT_SOURCE_DIR}/test/test_github_upload_queue.py)
++  set_tests_properties(github_upload_queue_python PROPERTIES TIMEOUT 30)
+   add_test(NAME hub_python COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_hub.py
+@@ -52,3 +55,3 @@
+ install(FILES src/rviz_viewport.py src/camera_views.py src/developer_tools.py src/screens.py src/vehicle_status.py
+-  src/calibration_details.py src/bag_recorder.py src/network_status.py src/sketch_pad.py src/hub_widgets.py
++  src/calibration_details.py src/bag_recorder.py src/github_upload_queue.py src/network_status.py src/sketch_pad.py src/hub_widgets.py
+   DESTINATION lib/${PROJECT_NAME})
+--- a/ros2_ws/src/vehicle_ui_hub/src/bag_recorder.py
++++ b/ros2_ws/src/vehicle_ui_hub/src/bag_recorder.py
+@@ -26,2 +26,3 @@
+ from rosidl_runtime_py.utilities import get_message
++from github_upload_queue import queue_recording
+ from hub_widgets import AnimatedStatusLabel
+@@ -602,3 +603,11 @@
+         if status == QtCore.QProcess.NormalExit and code == 0 and (Path(self._bag_path) / 'metadata.yaml').exists():
+-            self._finish_idle('Saved: ' + self._bag_path)
++            try:
++                queued = queue_recording(self._bag_path)
++            except (OSError, ValueError) as error:
++                self._finish_idle('Saved locally: ' + self._bag_path + '\nGitHub upload was not queued: ' + str(error), True)
++            else:
++                message = 'Saved: ' + self._bag_path
++                if queued:
++                    message += '\nQueued for public GitHub upload.'
++                self._finish_idle(message)
+         elif self._stop_requested and not os.path.exists(self._bag_path):
+--- /dev/null
++++ b/ros2_ws/src/vehicle_ui_hub/src/github_upload_queue.py
+@@ -0,0 +1,60 @@
++"""Hand completed recordings to the optional host-side GitHub uploader."""
++
++import datetime
++import json
++import os
++from pathlib import Path
++import tempfile
++import uuid
++
++
++def checkout_root():
++    configured = os.environ.get('NOVA_1811_STACK_ROOT')
++    if configured:
++        return Path(configured).resolve()
++    root = Path.cwd().resolve()
++    for candidate in (root, *root.parents):
++        if (candidate / 'ros2_ws/src/vehicle_ui_hub').is_dir():
++            return candidate
++    return None
++
++
++def queue_recording(bag_path, root=None):
++    """Queue a completed bag when setup enabled uploads; never upload here.
++
++    The ROS process runs in a container. Paths below the mounted checkout are
++    written relative to that checkout so the host service can find the same bag.
++    """
++    root = Path(root).resolve() if root is not None else checkout_root()
++    if root is None or not (root / '.rosbag-upload' / 'enabled').is_file():
++        return None
++    bag = Path(bag_path).resolve(strict=True)
++    if not bag.is_dir() or not (bag / 'metadata.yaml').is_file():
++        raise ValueError('The completed bag directory or metadata.yaml is missing.')
++    try:
++        relative = bag.relative_to(root)
++    except ValueError as exc:
++        raise ValueError('The bag is outside the mounted checkout; upload it from the Karbon terminal.') from exc
++    pending = root / '.rosbag-upload' / 'pending'
++    if not pending.is_dir():
++        raise OSError('The upload queue is missing. Run the GitHub upload setup on Karbon again.')
++
++    job_id = uuid.uuid4().hex
++    job = {'version': 1, 'id': job_id, 'source_type': 'checkout', 'source': relative.as_posix(),
++           'created': datetime.datetime.now(datetime.timezone.utc).isoformat()}
++    descriptor, temporary = tempfile.mkstemp(prefix='.new-', suffix='.json', dir=pending)
++    try:
++        with os.fdopen(descriptor, 'w', encoding='utf-8') as stream:
++            json.dump(job, stream)
++            stream.flush()
++            os.fsync(stream.fileno())
++        # The GUI may run as root in Docker while the uploader runs as the
++        # checkout owner on the host. The owner must be able to read the job.
++        if os.geteuid() == 0:
++            owner = root.stat()
++            os.chown(temporary, owner.st_uid, owner.st_gid)
++        os.replace(temporary, pending / (job_id + '.json'))
++    finally:
++        if os.path.exists(temporary):
++            os.unlink(temporary)
++    return job_id
+--- /dev/null
++++ b/ros2_ws/src/vehicle_ui_hub/test/test_github_upload_queue.py
+@@ -0,0 +1,49 @@
++import json
++import os
++from pathlib import Path
++import sys
++import tempfile
++import unittest
++
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
++from github_upload_queue import queue_recording
++
++
++class UploadQueueTest(unittest.TestCase):
++    def test_disabled_setup_does_not_queue(self):
++        with tempfile.TemporaryDirectory() as directory:
++            self.assertIsNone(queue_recording(Path(directory) / 'bag', root=directory))
++            self.assertFalse((Path(directory) / '.rosbag-upload').exists())
++
++    def test_completed_bag_is_queued_with_checkout_relative_path(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            pending = root / '.rosbag-upload' / 'pending'
++            pending.mkdir(parents=True)
++            (pending.parent / 'enabled').write_text('{}')
++            bag = root / 'recordings' / 'test bag'
++            bag.mkdir(parents=True)
++            (bag / 'metadata.yaml').write_text('test')
++            job_id = queue_recording(bag, root=root)
++            job = json.loads((pending / (job_id + '.json')).read_text())
++            self.assertEqual(job['source_type'], 'checkout')
++            self.assertEqual(job['source'], 'recordings/test bag')
++            self.assertTrue((bag / 'metadata.yaml').exists())
++
++    def test_outside_checkout_is_reported_and_not_queued(self):
++        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as other:
++            root = Path(directory)
++            pending = root / '.rosbag-upload' / 'pending'
++            pending.mkdir(parents=True)
++            (pending.parent / 'enabled').write_text('{}')
++            bag = Path(other) / 'bag'
++            bag.mkdir()
++            (bag / 'metadata.yaml').write_text('test')
++            with self.assertRaisesRegex(ValueError, 'outside the mounted checkout'):
++                queue_recording(bag, root=root)
++            self.assertFalse(list(pending.iterdir()))
++
++
++if __name__ == '__main__':
++    unittest.main()
